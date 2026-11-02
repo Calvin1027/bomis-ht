@@ -30,6 +30,12 @@ X_new = model.sample(len(X0) - len(X1))   # synthetic minority rows
 
 A runnable example is in `python examples/quickstart.py`.
 
+The default `model.sample(n, allocation="even")` repeats the selected novel cells evenly.
+`model.sample(n, allocation="ht")` keeps the same selected cell set R and row count per distance,
+but allocates rows within distances whose candidates were enumerated in proportion to
+Q_iota / lambda (the tilted decoder weight divided by the target inclusion probability),
+with at least one row per selected cell.
+
 ## Reproducing the experiments
 
 ```bash

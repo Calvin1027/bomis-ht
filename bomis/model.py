@@ -79,6 +79,35 @@ def pips(q, n):
         free &= ~over
 
 
+def min_one_split(q, n):
+    """Integer split of n proportional to q, with at least one row per cell."""
+    q = np.asarray(q, dtype=float)
+    if not len(q) or n < len(q) or np.any(q < 0) or not np.isfinite(q).all() or q.sum(axis=0) <= 0:
+        raise ValueError("min_one_split needs finite nonnegative weights and n >= len(q)")
+    q = q / q.sum(axis=0)
+    if n == len(q):
+        return np.ones(len(q), dtype=np.int64)
+    fixed = np.zeros(len(q), dtype=bool)
+    while True:
+        t = (n - fixed.sum(axis=0)) / q[~fixed].sum(axis=0)
+        add = (~fixed) & (t * q <= 1)
+        if not add.any():
+            target = t * q
+            break
+        fixed |= add
+    counts = np.floor(target).astype(np.int64)
+    counts[fixed] = 1
+    free = np.flatnonzero(~fixed)
+    frac = np.round(target[free] - np.floor(target[free]), 9)
+    order = np.lexsort((free, -frac))
+    K = int(n - counts.sum(axis=0))
+    assert 0 <= K <= len(free)
+    counts[free[order[:K]]] += 1
+    assert counts.sum(axis=0) == n
+    assert np.all(counts >= 1)
+    return counts
+
+
 def certify_threshold(n0, n1, r, level, grid_size=20000):
     """Smallest count x with sup_pi (1 - r pi)^n1 P(Bin(n0, pi) >= x) <= level.
 
@@ -425,7 +454,25 @@ class BOMiS:
             out |= (self.fresh_N[3][self._fresh_codes(Z, lo, lo + step)] == seen).any(1)
         return out
 
-    def _novel(self, n_new, budget):
+    def _ht_rows(self, R, n_new, ratio, exact):
+        """Repeat R within each distance in proportion to Q_iota / lambda, at least once per cell."""
+        dist = self._dist(R) if self.shells else np.full(len(R), -1, dtype=np.int64)
+        even = np.bincount(np.arange(n_new) % len(R), minlength=len(R))
+        count = np.zeros(len(R), dtype=np.int64)
+        keys = row_keys(R)
+        for s in np.unique(dist):
+            at = np.flatnonzero(dist == s)
+            v = np.ones(len(at))
+            if s in exact:
+                defined = np.array([keys[i] in ratio for i in at], dtype=bool)
+                for j in np.flatnonzero(defined):
+                    v[j] = ratio[keys[at[j]]]
+                v[~defined] = np.min(v[defined]) if defined.any() else 1.0
+            q = len(at) / len(R) * v / v.sum(axis=0)
+            count[at] = min_one_split(q, int(even[at].sum(axis=0)))
+        return np.repeat(R, count, axis=0)
+
+    def _novel(self, n_new, budget, allocation="even"):
         """n_new novel rows, outside O and outside the majority configurations.
 
         1. Distance s to O receives the largest-remainder share of n_new under shell_law, and keeps at most
@@ -437,7 +484,9 @@ class BOMiS:
         4. The decoder law is tilted so that the share of cells with an order-(k + 1) pattern seen in neither
            sample equals ell (_fit_fresh).
         5. A short count is completed with the remaining candidates in decreasing posterior odds, with no
-           distance above its Chao1 count, and the kept cells are repeated evenly to n_new rows.
+           distance above its Chao1 count. With allocation="even" (default), the kept cells are repeated
+           evenly to n_new rows. With "ht", each distance keeps the same row count, and listed distances
+           allocate rows in proportion to Q_iota / lambda, with at least one row per kept cell.
         """
         rng = self.rng
         skip = self.observed | self.majority
@@ -512,6 +561,8 @@ class BOMiS:
                 pool = {k: v for k, v in pool.items() if k in kept}
             if full():
                 break
+        if allocation == "ht":
+            ratio = {}
         for s, (Z, odds, lp, u) in cand.items():
             ok = (odds >= 0) & np.isfinite(logw[u.astype(int)])
             score = lp[ok] + logw[u[ok].astype(int)]
@@ -520,6 +571,9 @@ class BOMiS:
                 lam, v = pips(np.exp(score - score.max()), cap[s]), rng.random(int(ok.sum()))
                 with np.errstate(divide="ignore"):
                     key = np.log(v) - np.log1p(-v) - np.log(lam) + np.log1p(-lam)
+                if allocation == "ht":
+                    q = np.exp(score - score.max())
+                    ratio.update((k, a / b) for k, a, b in zip(row_keys(Z[ok]), q, lam) if b > 0)
             top = np.argsort(key, kind="stable")[:cap[s]]
             got[s] = dict(zip(row_keys(Z[ok][top]), Z[ok][top]))
             pool.update((k, (o, z)) for k, o, z in zip(row_keys(Z), odds.tolist(), Z) if k not in got[s])
@@ -538,16 +592,22 @@ class BOMiS:
             got.setdefault("fill", {})[key] = z
         R = [np.array(list(g.values()), dtype=np.int64) for g in got.values() if len(g)]
         R = np.vstack(R) if R else np.zeros((0, self.d), dtype=np.int64)
+        if allocation == "ht" and len(R):
+            return self._ht_rows(R, n_new, ratio, exact)
         return R[np.arange(n_new) % len(R)] if len(R) else R
 
-    def sample(self, n, budget=50):
+    def sample(self, n, budget=50, allocation="even"):
         """n synthetic minority rows. A Binomial(n, G) number are novel rows (_novel), and the rest are
         observed minority rows drawn from the decoder law restricted to O. If the draw budget leaves the
-        novel quota unfilled, the gap is filled with observed rows."""
+        novel quota unfilled, the gap is filled with observed rows. allocation="even" (default) repeats
+        the selected novel cells evenly. "ht" keeps those cells and each distance's row count, allocating
+        within listed distances in proportion to Q_iota / lambda, with at least one row per cell."""
+        if allocation not in ("even", "ht"):
+            raise ValueError("allocation must be 'even' or 'ht'")
         n_new = int(self.rng.binomial(n, self.M_hat))
         lp = self.log_prob(self.O)
         w_O = np.exp(lp - lp.max())
         w_O /= w_O.sum()
-        new = self._novel(n_new, budget)[:n_new] if budget else np.zeros((0, self.d), dtype=np.int64)
+        new = self._novel(n_new, budget, allocation)[:n_new] if budget else np.zeros((0, self.d), dtype=np.int64)
         seen = self.O[self.rng.choice(len(self.O), n - len(new), p=w_O)]
         return self.rng.permutation(np.vstack([seen, new]))
